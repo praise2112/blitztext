@@ -3,7 +3,7 @@
 BlitzText is a high-performance library for efficient keyword extraction and replacement in strings. It is based on the [FlashText](https://github.com/vi3k6i5/flashtext) and  [Aho-Corasick](https://en.wikipedia.org/wiki/Aho%E2%80%93Corasick_algorithm) algorithm. There are both Rust and Python implementations.
 Main difference form Aho-Corasick is that BlitzText only matches the longest pattern in a greedy manner.
 
-<img src="benches/benchmark_results_single.png">
+<img src="https://github.com/praise2112/blitztext/raw/main/benches/benchmark_results_single.png">
 
 ## Table of Contents
 - [Installation](#installation)
@@ -246,7 +246,7 @@ BlitzText is designed for high performance, making it suitable for processing la
 Benchmark details [here](benches/benchmark_results.md).
 
 Mult-threaded performance:
-<img src="benches/benchmark_results_multi.png">
+<img src="https://github.com/praise2112/blitztext/raw/main/benches/benchmark_results_multi.png">
 
 ## Contributing
 

@@ -4,6 +4,7 @@ use crate::utils::{is_whitespace, round};
 use rayon::prelude::*;
 use std::cmp::{max, min};
 use std::collections::HashMap;
+use std::mem::size_of;
 
 use std::sync::Arc;
 use serde::{Deserialize, Serialize};
@@ -1049,7 +1050,7 @@ mod tests {
         let mut kp = KeywordProcessor::new();
         kp.add_keyword("rust", None);
         kp.add_keyword("programming", Some("coding"));
-        println!("m  {:?}", (char::MAX as usize) / 64 + 1);
+        // println!("m  {:?}", (char::MAX as usize) / 64 + 1);
 
         assert!(kp.remove_keyword("rust"));
         assert!(!kp.remove_keyword("rust")); // Already removed
@@ -1098,7 +1099,6 @@ mod tests {
         let text = "私は寿司と刺身が好きです。";
 
         let matches = kp.extract_keywords(text, None);
-        println!("KKKK: {:?}", matches);
         assert_eq!(matches.len(), 2);
         assert_eq!(matches[0].keyword, "Sushi");
         assert_eq!(matches[1].keyword, "Sashimi");
@@ -1151,7 +1151,7 @@ mod tests {
         let text = "I love rust programming and computer science.";
         let mut keywords = kp.extract_keywords_parallel(text, None);
         keywords.sort_by(|a, b| a.keyword.cmp(&b.keyword));
-        println!("{:?}", keywords);
+        // println!("{:?}", keywords);
 
         assert_eq!(
             keywords,
@@ -1250,7 +1250,7 @@ mod tests {
 
         // Fuzzy match with threshold
         let result = kp.extract_keywords("wurld", Some(0.5));
-        println!("res: {:?}", result);
+        // println!("res: {:?}", result);
         assert_eq!(result.len(), 1);
         assert_eq!(
             result,
@@ -1491,7 +1491,7 @@ mod tests {
 
         let text = "I-love-rust-programming-and-1coding2";
         let keywords = kp.extract_keywords(text, None);
-        println!("{:?}", keywords);
+        // println!("{:?}", keywords);
 
         assert_eq!(
             keywords,
@@ -1513,7 +1513,7 @@ mod tests {
 
         kp.add_non_word_boundary('-');
         let keywords = kp.extract_keywords(text, None);
-        println!("{:?}", keywords);
+        // println!("{:?}", keywords);
         assert_eq!(keywords.len(), 0);
     }
 }

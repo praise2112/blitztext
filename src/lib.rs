@@ -104,8 +104,6 @@
 //! ## Performance
 //!
 //! BlitzText is optimized for high-speed operations, making it suitable for processing large volumes of text. It uses a trie-based data structure for efficient matching and supports parallel processing for handling multiple texts simultaneously.
-//! ```
-//!
 //!
 
 mod char_set;

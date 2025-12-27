@@ -1,6 +1,6 @@
 [package]
 name = "blitztext"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2021"
 authors = ["Praise Oketola <oketola.praise@gmail.com>"]
 description = "A library for fast keyword extraction and replacement in strings."

@@ -118,6 +118,8 @@ jobs:
           architecture: ${{ matrix.platform.target }}
       - name: Build wheels
         uses: PyO3/maturin-action@v1
+        env:
+          PYO3_USE_ABI3_FORWARD_COMPATIBILITY: '1'
         with:
           target: ${{ matrix.platform.target }}
           args: --release --out dist --find-interpreter
@@ -133,9 +135,9 @@ jobs:
     strategy:
       matrix:
         platform:
-          - runner: macos-13
+          - runner: macos-15
             target: x86_64
-          - runner: macos-14
+          - runner: macos-latest
             target: aarch64
     steps:
       - uses: actions/checkout@v4
@@ -156,6 +158,8 @@ jobs:
           python-version: '3.13'
       - name: Build wheels
         uses: PyO3/maturin-action@v1
+        env:
+          PYO3_USE_ABI3_FORWARD_COMPATIBILITY: '1'
         with:
           target: ${{ matrix.platform.target }}
           args: --release --out dist --find-interpreter

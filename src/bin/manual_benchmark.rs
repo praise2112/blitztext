@@ -4,19 +4,21 @@ use std::time::Instant;
 use blitztext::KeywordProcessor;
 use rand::seq::IndexedRandom;
 use rand::Rng;
-use regex::Regex;
+// use regex::Regex;
+use regex::bytes::Regex;
+
 
 fn get_word_of_length(str_length: usize) -> String {
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     (0..str_length)
-        .map(|_| rng.gen_range(b'a'..=b'z') as char)
+        .map(|_| rng.random_range(b'a'..=b'z') as char)
         .collect()
 }
 
 fn benchmark_keyword_extraction() -> Vec<(usize, f64, f64)> {
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     let all_words: Vec<String> = (0..100000)
-        .map(|_| get_word_of_length(rng.gen_range(3..=8)))
+        .map(|_| get_word_of_length(rng.random_range(3..=8)))
         .collect();
 
     let mut results = Vec::new();
@@ -65,7 +67,10 @@ fn benchmark_keyword_extraction() -> Vec<(usize, f64, f64)> {
         let _ = keyword_processor.extract_keywords(&story, None);
         let mid = Instant::now();
         // let _ = regex.matches(&story); //
-        let _ = regex.find_iter(&story).count();
+        // let _ = regex.find(&story).unwrap().len(); //
+        // let _ = regex.find_iter(&story).count();
+        // let _ = regex.find(&story);
+        let _ = regex.find(story.as_bytes());
         let end = Instant::now(); //
 
         let flashtext_time = mid.duration_since(start).as_secs_f64();

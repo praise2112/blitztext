@@ -1,25 +1,37 @@
-use crate::char_set::CharSet;
+use crate::char_set::CompactCharSet;
+use crate::compiled_trie::CompiledTrie;
+use crate::fuzzy::{self, FuzzyScratch, TrieView};
 use crate::trie::TrieNode;
 use crate::utils::{is_whitespace, round};
 use rayon::prelude::*;
-use std::cmp::{max, min};
 use std::collections::HashMap;
 use std::mem::size_of;
+use std::borrow::Cow;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::OnceLock;
 
-use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 /// A struct for handling keyword matching, fuzzy matching, and replacement in text.
 #[derive(Serialize, Deserialize)]
 pub struct KeywordProcessor {
     /// Set of characters that are considered part of a word.
-    non_word_boundaries: CharSet,
+    non_word_boundaries: CompactCharSet,
     /// The root of the keyword trie.
     root: TrieNode,
     /// Whether the keyword matching should be case-sensitive.
     case_sensitive: bool,
     /// Whether to allow overlapping matches.
     allow_overlaps: bool,
+    /// Faster read-only copy of `root`, dropped when keywords change.
+    #[serde(skip)]
+    compiled: OnceLock<CompiledTrie>,
+    /// Number of nodes in `root`; counted on first use after deserializing.
+    #[serde(skip)]
+    node_count: OnceLock<usize>,
+    /// Matching work done with `root` since keywords last changed, in text bytes.
+    #[serde(skip)]
+    work_since_change: AtomicUsize,
 }
 
 impl KeywordProcessor {
@@ -61,7 +73,7 @@ impl KeywordProcessor {
     /// let case_sensitive_processor = KeywordProcessor::with_options(true, false);
     /// ```
     pub fn with_options(case_sensitive: bool, allow_overlaps: bool) -> Self {
-        let mut non_word_boundaries = CharSet::new();
+        let mut non_word_boundaries = CompactCharSet::new();
         non_word_boundaries.extend('a'..='z');
         non_word_boundaries.extend('A'..='Z');
         non_word_boundaries.extend('0'..='9');
@@ -71,6 +83,9 @@ impl KeywordProcessor {
             root: TrieNode::new(),
             case_sensitive,
             allow_overlaps,
+            compiled: OnceLock::new(),
+            node_count: OnceLock::new(),
+            work_since_change: AtomicUsize::new(0),
         }
     }
 
@@ -116,15 +131,25 @@ impl KeywordProcessor {
 
         let clean_name = clean_name.unwrap_or(&keyword).to_string();
 
+        let mut added_nodes = 0;
         let mut current_node = &mut self.root;
         // we use bytes as char instead of char because extract_keywords uses bytes
         for byte in keyword.bytes() {
-            current_node = current_node
-                .children
-                .entry(byte as char)
-                .or_insert_with(|| Box::new(TrieNode::new()));
+            current_node = current_node.children.entry(byte as char).or_insert_with(|| {
+                added_nodes += 1;
+                Box::new(TrieNode::new())
+            });
         }
         current_node.keyword = Some(clean_name);
+        self.keywords_changed(added_nodes as isize);
+    }
+
+    fn keywords_changed(&mut self, node_count_change: isize) {
+        self.compiled.take();
+        *self.work_since_change.get_mut() = 0;
+        if let Some(node_count) = self.node_count.get_mut() {
+            *node_count = node_count.saturating_add_signed(node_count_change);
+        }
     }
 
     /// Removes a keyword from the processor.
@@ -157,7 +182,12 @@ impl KeywordProcessor {
             keyword.to_lowercase()
         };
 
-        Self::remove_keyword_helper(&keyword, &mut self.root)
+        let mut removed_nodes = 0;
+        let removed = Self::remove_keyword_helper(keyword.as_bytes(), &mut self.root, &mut removed_nodes);
+        if removed {
+            self.keywords_changed(-(removed_nodes as isize));
+        }
+        removed
     }
 
     /// Helper function for removing a keyword from the trie.
@@ -194,25 +224,21 @@ impl KeywordProcessor {
     /// * Time complexity: O(m), where m is the length of the keyword.
     /// * Space complexity: O(m) due to the recursion stack.
     ///
-    fn remove_keyword_helper(keyword: &str, node: &mut TrieNode) -> bool {
-        if keyword.is_empty() {
-            if node.keyword.is_some() {
-                node.keyword = None;
-                true
-            } else {
-                false
-            }
-        } else {
-            let (first_char, rest) = keyword.split_at(1);
-            if let Some(child) = node.children.get_mut(&first_char.chars().next().unwrap()) {
-                let removed = Self::remove_keyword_helper(rest, child);
+    fn remove_keyword_helper(keyword: &[u8], node: &mut TrieNode, removed_nodes: &mut usize) -> bool {
+        if let Some((&first_byte, rest)) = keyword.split_first() {
+            let key = first_byte as char;
+            if let Some(child) = node.children.get_mut(&key) {
+                let removed = Self::remove_keyword_helper(rest, child, removed_nodes);
                 if removed && child.children.is_empty() && child.keyword.is_none() {
-                    node.children.remove(&first_char.chars().next().unwrap());
+                    node.children.remove(&key);
+                    *removed_nodes += 1;
                 }
                 removed
             } else {
                 false
             }
+        } else {
+            node.keyword.take().is_some()
         }
     }
 
@@ -300,7 +326,7 @@ impl KeywordProcessor {
     /// ```
     pub fn get_all_keywords(&self) -> HashMap<String, String> {
         let mut keywords = HashMap::new();
-        self.collect_keywords(&self.root, String::new(), &mut keywords);
+        self.collect_keywords(&self.root, &mut Vec::new(), &mut keywords);
         keywords
     }
 
@@ -323,16 +349,17 @@ impl KeywordProcessor {
     fn collect_keywords(
         &self,
         node: &TrieNode,
-        prefix: String,
+        prefix: &mut Vec<u8>,
         keywords: &mut HashMap<String, String>,
     ) {
         if let Some(clean_name) = &node.keyword {
-            keywords.insert(prefix.clone(), clean_name.clone());
+            let keyword = String::from_utf8_lossy(prefix).into_owned();
+            keywords.insert(keyword, clean_name.clone());
         }
-        for (ch, child) in &node.children {
-            let mut new_prefix = prefix.clone();
-            new_prefix.push(*ch);
-            self.collect_keywords(child, new_prefix, keywords);
+        for (&byte, child) in &node.children {
+            prefix.push(byte as u8);
+            self.collect_keywords(child, prefix, keywords);
+            prefix.pop();
         }
     }
 
@@ -354,7 +381,7 @@ impl KeywordProcessor {
     /// processor.set_non_word_boundaries(&['a', 'b', 'c', '1', '2', '3']);
     /// ```
     pub fn set_non_word_boundaries(&mut self, boundaries: &[char]) {
-        self.non_word_boundaries = CharSet::new();
+        self.non_word_boundaries = CompactCharSet::new();
         self.non_word_boundaries.extend(boundaries.iter().copied());
     }
 
@@ -438,19 +465,10 @@ impl KeywordProcessor {
     /// assert_eq!(processor.get_keyword("python"), None);
     /// ```
     pub fn get_keyword(&self, keyword: &str) -> Option<String> {
-        let keyword = if self.case_sensitive {
-            keyword.to_string()
-        } else {
-            keyword.to_lowercase()
-        };
-
+        let keyword = self.normalize_case(keyword);
         let mut current_node = &self.root;
-        for ch in keyword.chars() {
-            if let Some(next_node) = current_node.children.get(&ch) {
-                current_node = next_node;
-            } else {
-                return None;
-            }
+        for byte in keyword.bytes() {
+            current_node = current_node.children.get(&(byte as char))?;
         }
         current_node.keyword.clone()
     }
@@ -497,87 +515,12 @@ impl KeywordProcessor {
             "Threshold must be between 0 and 1"
         );
 
-        // Initialize vector to store found matches
+        let original = text;
+        let text = self.normalize_case(original);
         let mut matches = Vec::new();
-
-        let text = if self.case_sensitive {
-            text.to_string()
-        } else {
-            text.to_lowercase()
-        };
-
-        // working with bytes is faster than strings
-        let text_bytes = text.as_bytes();
-
-        // Iterate through each character in the text
-        let mut i = 0;
-        while i < text_bytes.len() {
-            // Check if we're at a word boundary
-            // This is true if we're at the start of the text or the previous character is not a word character
-            if i == 0 || !self.is_non_word_boundary(text_bytes[i - 1] as char) {
-                // Choose between fuzzy and exact matching based on threshold
-                // let (found, length, similarity) = self.find_keyword(&text_bytes[i..]);
-                let (found, length, similarity) = if threshold < 1.0 {
-                    self.find_keyword_fuzzy(&text_bytes[i..], threshold)
-                } else {
-                    self.find_keyword(&text_bytes[i..])
-                };
-
-                // If a keyword is found
-                if let Some(keyword) = found {
-                    if threshold == 1.0 {
-                        // For exact matching, keep the word boundary check
-                        // For ensuring that we only match complete words, not partial words or substrings within larger words.
-                        // This is true if we're at the end of the text or the next character is not a word character
-                        if i + length == text_bytes.len()
-                            || !self.is_non_word_boundary(text_bytes[i + length] as char)
-                        {
-                            matches.push(KeywordMatch {
-                                keyword,
-                                similarity: round(similarity, 2),
-                                start: if is_whitespace(text_bytes[i]) {
-                                    i + 1
-                                } else {
-                                    i
-                                },
-                                end: i + length,
-                            });
-                            // Move the index past this keyword
-                            i += length;
-                            continue;
-                        }
-                    } else {
-                        // For fuzzy matching, add the match with lenient boundary check
-                        // on of next 3 characters is a non-word boundary
-                        let end = if is_whitespace(text_bytes[i + length - 1]) {
-                            i + length - 1
-                        } else {
-                            i + length
-                        };
-                        let is_boundary_in_next_x_chars = (end..min(end + 3, text.len()))
-                            .any(|j| !self.is_non_word_boundary(text_bytes[j] as char));
-                        if is_boundary_in_next_x_chars || end == text_bytes.len() {
-                            matches.push(KeywordMatch {
-                                keyword,
-                                similarity: round(similarity, 2),
-                                start: if is_whitespace(text_bytes[i]) {
-                                    i + 1
-                                } else {
-                                    i
-                                },
-                                end,
-                            });
-                            // Move the index past this keyword
-                            i += length;
-                            continue;
-                        }
-                    }
-                }
-            }
-            // If no keyword found or not at a word boundary, move to the next character
-            i += 1;
-        }
-
+        let trie = self.compiled_trie(text.len(), threshold);
+        self.scan_with(trie, &text, 0..text.len(), threshold, &mut matches);
+        self.map_to_original_offsets(original, &mut matches);
         matches
     }
 
@@ -624,85 +567,23 @@ impl KeywordProcessor {
             "Threshold must be between 0 and 1"
         );
 
-        let text = if self.case_sensitive {
-            text.to_string()
-        } else {
-            text.to_lowercase()
-        };
+        let original = text;
+        let text = self.normalize_case(original);
+        let trie = self.compiled_trie(text.len(), threshold);
+        let chunk_size = (text.len() / rayon::current_num_threads()).max(1000);
 
-        let text_bytes = text.as_bytes();
-        let processor = Arc::new(self);
-
-        let chunk_size = (text_bytes.len() / rayon::current_num_threads()).max(1000);
-
-        (0..text_bytes.len())
+        let mut matches: Vec<KeywordMatch> = (0..text.len())
             .into_par_iter()
             .step_by(chunk_size)
             .flat_map(|start| {
-                let end = (start + chunk_size).min(text_bytes.len());
-                let processor = Arc::clone(&processor);
-
+                let end = (start + chunk_size).min(text.len());
                 let mut local_matches = Vec::new();
-                let mut i = start;
-                while i < end {
-                    if i == 0 || !processor.is_non_word_boundary(text_bytes[i - 1] as char) {
-                        let (found, length, similarity) = if threshold < 1.0 {
-                            processor.find_keyword_fuzzy(&text_bytes[i..], threshold)
-                        } else {
-                            processor.find_keyword(&text_bytes[i..])
-                        };
-
-                        if let Some(keyword) = found {
-                            if threshold == 1.0 {
-                                if i + length == text_bytes.len()
-                                    || !processor
-                                        .is_non_word_boundary(text_bytes[i + length] as char)
-                                {
-                                    local_matches.push(KeywordMatch {
-                                        keyword,
-                                        similarity: round(similarity, 2),
-                                        start: if is_whitespace(text_bytes[i]) {
-                                            i + 1
-                                        } else {
-                                            i
-                                        },
-                                        end: i + length,
-                                    });
-                                    i += length;
-                                    continue;
-                                }
-                            } else {
-                                let end = if is_whitespace(text_bytes[i + length - 1]) {
-                                    i + length - 1
-                                } else {
-                                    i + length
-                                };
-                                let is_boundary_in_next_x_chars =
-                                    (end..min(end + 3, text_bytes.len())).any(|j| {
-                                        !processor.is_non_word_boundary(text_bytes[j] as char)
-                                    });
-                                if is_boundary_in_next_x_chars || end == text_bytes.len() {
-                                    local_matches.push(KeywordMatch {
-                                        keyword,
-                                        similarity: round(similarity, 2),
-                                        start: if is_whitespace(text_bytes[i]) {
-                                            i + 1
-                                        } else {
-                                            i
-                                        },
-                                        end,
-                                    });
-                                    i += length;
-                                    continue;
-                                }
-                            }
-                        }
-                    }
-                    i += 1;
-                }
+                self.scan_with(trie, &text, start..end, threshold, &mut local_matches);
                 local_matches
             })
-            .collect()
+            .collect();
+        self.map_to_original_offsets(original, &mut matches);
+        matches
     }
 
     /// Extracts keywords from multiple texts in parallel.
@@ -753,135 +634,164 @@ impl KeywordProcessor {
             .collect()
     }
 
-    /// Helper method to find a keyword starting from a given position in the text.
-    ///
-    /// This method traverses the trie to find an exact match for a keyword in the text.
-    ///
-    /// # Arguments
-    ///
-    /// * `text_bytes` - The text to search in, as a byte slice.
-    ///
-    /// # Returns
-    ///
-    /// A tuple containing an Option with the found keyword (if any), the length of the match, and the similarity (1.0 for exact matches).
-    ///
-    /// # Complexity
-    ///
-    /// * Time complexity: O(m), where m is the length of the matched keyword.
-    fn find_keyword(&self, text_bytes: &[u8]) -> (Option<&str>, usize, f32) {
-        // covert text_bytes to string
-        let mut current_node = &self.root;
-        let mut last_keyword_node = None; // Last node representing a keyword
-        let mut last_keyword_pos = 0; // Position of the last keyword found
-
-        // for each character in the text starting from the current position
-        // check if there is a matching child node in the trie
-        for (i, &byte) in text_bytes.iter().enumerate() {
-            // Move to the next node in the trie
-            // println!("byte: {:?}, char: {:?}, is_byte_valid_char: {:?}", byte, byte as char, is_valid_char(&[byte]));
-            if let Some(next_node) = &current_node.children.get(&(byte as char)) {
-                // if let Some(next_node) = &current_node.children[byte as usize] {
-                current_node = next_node;
-                if current_node.keyword.is_some() {
-                    // If this node represents a keyword, remember it
-                    last_keyword_node = Some(current_node);
-                    last_keyword_pos = i;
-                }
-            } else {
-                break;
-            }
-        }
-        // println!("last_keyword_node: {:?}, last_keyword_pos: {:?}", last_keyword_node, last_keyword_pos);
-        if let Some(node) = last_keyword_node {
-            (node.keyword.as_deref(), last_keyword_pos + 1, 1.0)
-        } else {
-            (None, 0, 0.0)
+    /// Scans with the compiled trie when there is one, else with the editable trie.
+    fn scan_with<'a>(
+        &'a self,
+        trie: Option<&'a CompiledTrie>,
+        text: &str,
+        positions: std::ops::Range<usize>,
+        threshold: f32,
+        matches: &mut Vec<KeywordMatch<'a>>,
+    ) {
+        match trie {
+            Some(trie) => self.scan(trie, text, positions, threshold, matches),
+            None => self.scan(&self.root, text, positions, threshold, matches),
         }
     }
 
-    /// Helper method to find a keyword starting from a given position in the text with fuzzy matching.
-    ///
-    /// This method uses a depth-first search through the trie to find approximate matches,
-    /// allowing for insertions, deletions, and substitutions up to the specified threshold.
-    ///
-    /// # Arguments
-    ///
-    /// * `text_bytes` - The text to search in, as a byte slice.
-    /// * `threshold` - The minimum similarity required for a match (0.0 to 1.0).
-    ///
-    /// # Returns
-    ///
-    /// A tuple containing an Option with the found keyword (if any), the length of the match, and the similarity.
-    ///
-    /// # Complexity
-    ///
-    /// * Time complexity: O(n * m), where n is the length of the text and m is the average length of keywords.
-    ///   In practice, the threshold and early termination optimizations make it much faster for most inputs.
-    fn find_keyword_fuzzy(&self, text_bytes: &[u8], threshold: f32) -> (Option<&str>, usize, f32) {
-        // Initialize variables to keep track of the best match found
-        // let mut best_match: Option<String> = None;
-        let mut best_match: Option<&str> = None;
-        let mut best_match_length = 0;
-        let mut best_similarity = 0.0;
-
-        // Stack for depth-first search through the trie
-        // Each element is (node, depth in text, cumulative cost)
-        let mut stack = vec![(&self.root, 0, 0)];
-
-        // Depth-first search through the trie
-        while let Some((node, depth, cost)) = stack.pop() {
-            // Check if this node represents a keyword
-            if let Some(keyword) = &node.keyword {
-                let keyword_len = keyword.len();
-                // Use the maximum of current depth and keyword length for normalization
-                let max_length = max(depth, keyword_len);
-                // Calculate similarity as 1 - (cost / max_length)
-                let similarity = 1.0 - (cost as f32 / max_length as f32);
-                // println!("similarity: {:?}, depth: {:?}, cost: {:?}, s>=t: {:?}, best_similarity: {:?}, best_match: {:?}", similarity, depth, cost, similarity >= threshold, best_similarity, best_match);
-
-                // Update the best match if the similarity is above the threshold
-                if similarity >= threshold && similarity > best_similarity {
-                    best_match = Some(keyword);
-                    // best_match = Some(keyword.clone());
-                    best_match_length = depth;
-                    best_similarity = similarity;
-                }
+    /// Appends the matches that start inside `positions` to `matches`; a match may run past its end.
+    fn scan<'a, T: TrieView<'a>>(
+        &self,
+        trie: T,
+        text: &str,
+        positions: std::ops::Range<usize>,
+        threshold: f32,
+        matches: &mut Vec<KeywordMatch<'a>>,
+    ) {
+        let text_bytes = text.as_bytes();
+        let is_ascii_word_byte: [bool; 128] =
+            std::array::from_fn(|byte| self.is_non_word_boundary(byte as u8 as char));
+        // Whether the character at byte `i` is a word character, and its length in bytes
+        let word_char_at = |i: usize| match text_bytes[i] {
+            byte if byte < 128 => (is_ascii_word_byte[byte as usize], 1),
+            _ => {
+                let c = text[i..].chars().next().unwrap();
+                (self.is_non_word_boundary(c), c.len_utf8())
             }
+        };
+        let is_word_char_before = |i: usize| match text_bytes[i - 1] {
+            byte if byte < 128 => is_ascii_word_byte[byte as usize],
+            _ => self.is_non_word_boundary(text[..i].chars().next_back().unwrap()),
+        };
 
-            // Stop exploring this path if we've reached the end of the text, or it's word boundary
-            if depth >= text_bytes.len() {
-                // if depth >= text_bytes.len() || (depth >5 && !self.is_non_word_boundary(text_bytes[depth-5] as char)) {
+        let mut fuzzy_scratch = FuzzyScratch::default();
+        let mut i = positions.start;
+        'scan: while i < positions.end {
+            if !text.is_char_boundary(i) {
+                i += 1;
                 continue;
             }
-
-            // Get the current byte(char) in the text
-            let current_char = text_bytes[depth] as char;
-
-            // Explore exact matches (no additional cost)
-            if let Some(child) = &node.children.get(&current_char) {
-                stack.push((child, depth + 1, cost));
-            }
-
-            // Explore fuzzy matches
-            // Calculate current similarity to determine if we should continue exploring
-            let current_similarity = 1.0 - (cost as f32 / (depth + 1) as f32);
-            if current_similarity >= threshold {
-                // Insertion: skip the current character in the text (cost + 1)
-                stack.push((node, depth + 1, cost + 1));
-
-                // Deletion and Substitution
-                for (ch, child) in &node.children {
-                    if *ch != current_char {
-                        // Substitution: try all children with increased cost (cost + 1)
-                        stack.push((child, depth + 1, cost + 1));
+            // A keyword can only start at the text start or after a non-word character
+            if i > 0 && is_word_char_before(i) {
+                loop {
+                    let Some(&byte) = text_bytes[..positions.end].get(i) else {
+                        break 'scan;
+                    };
+                    // Runs once per text byte, so ASCII stays inline
+                    let (is_word, char_len) = match byte {
+                        byte if byte < 128 => (is_ascii_word_byte[byte as usize], 1),
+                        _ => word_char_at(i),
+                    };
+                    i += char_len;
+                    if !is_word {
+                        continue 'scan;
                     }
-                    // Deletion: skip the current node in the trie (cost + 1)
-                    stack.push((child, depth, cost + 1));
                 }
             }
+            // Choose between fuzzy and exact matching based on threshold
+            let (found, length, similarity) = if threshold < 1.0 {
+                fuzzy::best_fuzzy_prefix(trie, &text[i..], threshold, &mut fuzzy_scratch)
+            } else {
+                match trie.longest_prefix(&text_bytes[i..]) {
+                    Some((keyword, length)) => (Some(keyword), length, 1.0),
+                    None => (None, 0, 0.0),
+                }
+            };
+
+            if let Some(keyword) = found {
+                let start = if is_whitespace(text_bytes[i]) { i + 1 } else { i };
+                if threshold == 1.0 {
+                    // For ensuring that we only match complete words, not partial words or substrings within larger words.
+                    // This is true if we're at the end of the text or the next character is not a word character
+                    if i + length == text_bytes.len() || !word_char_at(i + length).0 {
+                        matches.push(KeywordMatch {
+                            keyword,
+                            similarity: round(similarity, 2),
+                            start,
+                            end: i + length,
+                        });
+                        i += length;
+                        continue;
+                    }
+                } else {
+                    // For fuzzy matching, accept a word boundary within the next 3 characters
+                    let end = if is_whitespace(text_bytes[i + length - 1]) {
+                        i + length - 1
+                    } else {
+                        i + length
+                    };
+                    let is_boundary_in_next_x_chars = text[end..]
+                        .chars()
+                        .take(3)
+                        .any(|c| !self.is_non_word_boundary(c));
+                    // A lone whitespace match trims to an inverted span, which is no match.
+                    if start <= end && (is_boundary_in_next_x_chars || end == text_bytes.len()) {
+                        matches.push(KeywordMatch {
+                            keyword,
+                            similarity: round(similarity, 2),
+                            start,
+                            end,
+                        });
+                        i += length;
+                        continue;
+                    }
+                }
+            }
+            // If no keyword found or not at a word boundary, move to the next character
+            i += 1;
         }
-        // println!("best_match: {:?}, best_match_length: {:?}, best_similarity: {:?}", best_match, best_match_length, best_similarity);
-        (best_match, best_match_length, best_similarity)
+    }
+
+    /// Matches are found in the lowercased text; when lowercasing changed its length,
+    /// moves each match onto the original characters it came from.
+    fn map_to_original_offsets(&self, original: &str, matches: &mut [KeywordMatch]) {
+        if self.case_sensitive || matches.is_empty() {
+            return;
+        }
+        let Some(char_starts) = lowercase_char_starts(original) else {
+            return;
+        };
+        for keyword_match in matches {
+            let start = char_starts[keyword_match.start];
+            keyword_match.end = if keyword_match.end == keyword_match.start {
+                start
+            } else {
+                let last_char = char_starts[keyword_match.end - 1];
+                last_char + original[last_char..].chars().next().map_or(0, char::len_utf8)
+            };
+            keyword_match.start = start;
+        }
+    }
+
+    fn normalize_case<'t>(&self, text: &'t str) -> Cow<'t, str> {
+        if self.case_sensitive {
+            Cow::Borrowed(text)
+        } else {
+            Cow::Owned(text.to_lowercase())
+        }
+    }
+
+    /// Returns the compiled trie once bytes scanned since the last edit (fuzzy weighted 64x)
+    /// reach 16x the node count; until then matching uses the editable trie.
+    fn compiled_trie(&self, text_len: usize, threshold: f32) -> Option<&CompiledTrie> {
+        if let Some(trie) = self.compiled.get() {
+            return Some(trie);
+        }
+        // Fuzzy matching costs far more per byte than exact matching.
+        let work = if threshold < 1.0 { text_len * 64 } else { text_len };
+        let total_work = self.work_since_change.fetch_add(work, Ordering::Relaxed) + work;
+        let node_count = *self.node_count.get_or_init(|| self.root.count_nodes());
+        (total_work >= node_count * 16).then(|| self.compiled.get_or_init(|| CompiledTrie::new(&self.root)))
     }
 
     /// Replaces keywords in the given text with their clean names.
@@ -915,19 +825,16 @@ impl KeywordProcessor {
     /// assert_eq!(result, "I love Rust Programming Language programming");
     /// ```
     pub fn replace_keywords(&self, text: &str, threshold: Option<f32>) -> String {
-        let matches = self.extract_keywords(text, threshold);
-        let mut result = text.to_string();
-
-        // Sort matches by start position in descending order
-        let mut sorted_matches = matches;
-        sorted_matches.sort_by(|a, b| b.start.cmp(&a.start));
-
-        for keyword_match in sorted_matches {
-            let start = keyword_match.start;
-            let end = keyword_match.end;
-            result.replace_range(start..end, &keyword_match.keyword);
+        let mut result = String::with_capacity(text.len());
+        let mut copied_up_to = 0;
+        for keyword_match in self.extract_keywords(text, threshold) {
+            // Two matches inside one character that lowercases to several can overlap.
+            let start = keyword_match.start.max(copied_up_to);
+            result.push_str(&text[copied_up_to..start]);
+            result.push_str(keyword_match.keyword);
+            copied_up_to = keyword_match.end.max(start);
         }
-
+        result.push_str(&text[copied_up_to..]);
         result
     }
 
@@ -990,16 +897,22 @@ impl KeywordProcessor {
         if self.allow_overlaps {
             return false;
         }
-        // Check if the character is in the set of non-word boundaries
-        self.non_word_boundaries.contains(ch)
-        // self.non_word_boundaries.contains(&ch)
+        if self.non_word_boundaries.contains(ch) {
+            return true;
+        }
+        // Text is lowercased before matching, so an uppercase boundary covers its lowercase form.
+        let mut uppercase = ch.to_uppercase();
+        match (self.case_sensitive, uppercase.next(), uppercase.next()) {
+            (false, Some(upper), None) if upper != ch => self.non_word_boundaries.contains(upper),
+            _ => false,
+        }
     }
 
     /// Calculates the approximate memory usage of the trie in bytes.
     ///
     /// This method provides an estimate of the memory used by the trie structure,
-    /// including all nodes and the strings stored in them. It does not include
-    /// the memory used by the KeywordProcessor struct itself.
+    /// including all nodes and the strings stored in them, plus the compiled
+    /// matching copy once it has been built.
     ///
     /// # Returns
     ///
@@ -1007,8 +920,9 @@ impl KeywordProcessor {
     pub fn calculate_memory_usage(&self) -> usize {
         let trie_memory = self.calculate_node_memory(&self.root);
 
+        let compiled_memory = self.compiled.get().map_or(0, CompiledTrie::memory_usage);
         // Add size of KeywordProcessor struct itself
-        trie_memory + size_of::<KeywordProcessor>()
+        trie_memory + compiled_memory + size_of::<KeywordProcessor>()
     }
 
     fn calculate_node_memory(&self, node: &TrieNode) -> usize {
@@ -1030,6 +944,21 @@ impl KeywordProcessor {
 
         memory
     }
+}
+
+/// For text whose lowercase form has a different byte length, maps every byte offset
+/// of `text.to_lowercase()` to the start of the original character it came from.
+fn lowercase_char_starts(text: &str) -> Option<Vec<usize>> {
+    let lowercase_len = |c: char| c.to_lowercase().map(char::len_utf8).sum::<usize>();
+    if text.is_ascii() || text.chars().all(|c| lowercase_len(c) == c.len_utf8()) {
+        return None;
+    }
+    let mut starts = Vec::with_capacity(text.len() + 1);
+    for (offset, c) in text.char_indices() {
+        starts.extend(std::iter::repeat_n(offset, lowercase_len(c)));
+    }
+    starts.push(text.len());
+    Some(starts)
 }
 
 /// A struct representing a keyword match in a text.
@@ -1291,7 +1220,7 @@ mod tests {
                 },
                 KeywordMatch {
                     keyword: "coding",
-                    similarity: 0.78,
+                    similarity: 0.82,
                     start: 20,
                     end: 29,
                 },
@@ -1515,5 +1444,167 @@ mod tests {
         let keywords = kp.extract_keywords(text, None);
         // println!("{:?}", keywords);
         assert_eq!(keywords.len(), 0);
+    }
+
+    #[test]
+    fn compiled_trie_matches_like_the_editable_trie() {
+        use rand::{rngs::StdRng, RngExt, SeedableRng};
+        let mut rng = StdRng::seed_from_u64(7);
+        let pieces = ["a", "b", "ab", "ba", "c", "é", "日", "😀", " ", " ", "-", "x"];
+        let random_string = |rng: &mut StdRng, max_pieces: usize| -> String {
+            (0..rng.random_range(0..=max_pieces))
+                .map(|_| pieces[rng.random_range(0..pieces.len())])
+                .collect()
+        };
+        for case in 0..300 {
+            let mut kp = KeywordProcessor::with_options(case % 3 == 0, case % 5 == 0);
+            for _ in 0..rng.random_range(1..40) {
+                let keyword = random_string(&mut rng, 4);
+                let clean_name = random_string(&mut rng, 3);
+                kp.add_keyword(&keyword, rng.random_bool(0.5).then_some(clean_name.as_str()));
+            }
+            let compiled = CompiledTrie::new(&kp.root);
+            for _ in 0..20 {
+                let text = random_string(&mut rng, 30);
+                for threshold in [1.0, 0.95, 0.8, 0.7, 0.6, 0.5] {
+                    let (mut expected, mut actual) = (Vec::new(), Vec::new());
+                    kp.scan(&kp.root, &text, 0..text.len(), threshold, &mut expected);
+                    kp.scan(&compiled, &text, 0..text.len(), threshold, &mut actual);
+                    assert_eq!(actual, expected, "text {text:?} threshold {threshold}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn non_ascii_non_word_boundary_joins_words() {
+        let mut kp = KeywordProcessor::new();
+        kp.add_keyword("caf", None);
+        assert_eq!(kp.extract_keywords("caf café", None).len(), 2);
+        kp.add_non_word_boundary('é');
+        let matches = kp.extract_keywords("caf café", None);
+        assert_eq!((matches.len(), matches[0].start, matches[0].end), (1, 0, 3));
+    }
+
+    #[test]
+    fn uppercase_boundary_applies_in_case_insensitive_mode() {
+        let mut kp = KeywordProcessor::new();
+        kp.add_keyword("caf", None);
+        kp.add_non_word_boundary('É');
+        assert_eq!(kp.extract_keywords("CAFÉ", None), vec![]);
+        assert_eq!(kp.extract_keywords("CAF.", None).len(), 1);
+    }
+
+    #[test]
+    fn offsets_point_into_original_text_when_lowercase_is_longer() {
+        let mut kp = KeywordProcessor::new();
+        kp.add_keyword("istanbul", Some("IST"));
+        let text = "İstanbul istanbul";
+        let matches = kp.extract_keywords(text, None);
+        assert_eq!(&text[matches[0].start..matches[0].end], "istanbul");
+    }
+
+    #[test]
+    fn fuzzy_tie_goes_to_smallest_clean_name() {
+        let mut kp = KeywordProcessor::new();
+        kp.add_keyword("cat", None);
+        kp.add_keyword("car", None);
+        let matches = kp.extract_keywords("cab", Some(0.6));
+        assert_eq!((matches[0].keyword, matches[0].similarity), ("car", 0.67));
+    }
+
+    #[test]
+    fn fuzzy_matches_a_missing_last_letter_at_text_end() {
+        let mut kp = KeywordProcessor::new();
+        kp.add_keyword("python", None);
+        let matches = kp.extract_keywords("I use pytho", Some(0.8));
+        assert_eq!((matches[0].keyword, matches[0].start, matches[0].end), ("python", 6, 11));
+    }
+
+    #[test]
+    fn fuzzy_match_leaves_trailing_punctuation_out() {
+        let mut kp = KeywordProcessor::new();
+        kp.add_keyword("python", None);
+        assert_eq!(kp.replace_keywords("I like pytho.", Some(0.8)), "I like python.");
+    }
+
+    #[test]
+    fn fuzzy_whitespace_only_match_is_dropped() {
+        let mut kp = KeywordProcessor::new();
+        kp.add_keyword("a ", Some("X"));
+        for text in ["Klong  ", "klong  "] {
+            assert!(kp.extract_keywords(text, Some(0.5)).iter().all(|m| m.start <= m.end));
+            assert_eq!(kp.replace_keywords(text, Some(0.5)), text);
+        }
+    }
+
+    #[test]
+    fn fuzzy_counts_a_wrong_accent_as_one_edit() {
+        let mut kp = KeywordProcessor::new();
+        kp.add_keyword("cafe", None);
+        let matches = kp.extract_keywords("café", Some(0.75));
+        assert_eq!((matches[0].similarity, matches[0].end), (0.75, 5));
+    }
+
+    fn processor_with_long_clean_name() -> KeywordProcessor {
+        let mut kp = KeywordProcessor::new();
+        kp.add_keyword("a", Some("<A#1>"));
+        kp
+    }
+
+    #[test]
+    fn fuzzy_extract_skips_zero_length_match_at_text_start() {
+        let kp = processor_with_long_clean_name();
+        assert_eq!(kp.extract_keywords("b", Some(0.8)), vec![]);
+        assert_eq!(kp.replace_keywords("b", Some(0.8)), "b");
+    }
+
+    #[test]
+    fn fuzzy_extract_terminates_on_zero_length_match_after_text_start() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let kp = processor_with_long_clean_name();
+            let matches: Vec<(usize, usize)> = kp
+                .extract_keywords("a b", Some(0.8))
+                .iter()
+                .map(|m| (m.start, m.end))
+                .collect();
+            sender.send(matches).unwrap();
+        });
+        let matches = receiver
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("fuzzy extraction did not finish");
+        assert_eq!(matches, vec![(0, 1)]);
+    }
+
+    #[test]
+    fn fuzzy_matches_start_and_end_on_character_boundaries() {
+        let mut kp = KeywordProcessor::new();
+        kp.add_keyword("a", None);
+        kp.add_keyword("ab", None);
+        let matches = kp.extract_keywords("a😀b", Some(0.5));
+        assert_eq!((matches[1].start, matches[1].end), (5, 6));
+        assert_eq!(kp.replace_keywords("a😀b", Some(0.5)), "a😀ab");
+    }
+
+    #[test]
+    fn replace_handles_text_whose_lowercase_is_longer() {
+        let mut kp = KeywordProcessor::new();
+        kp.add_keyword("istanbul", Some("IST"));
+        assert_eq!(kp.replace_keywords("İstanbul istanbul", None), "İstanbul IST");
+    }
+
+    #[test]
+    fn non_ascii_keywords_can_be_listed_looked_up_and_removed() {
+        let mut kp = KeywordProcessor::new();
+        kp.add_keyword("naïve", Some("naive"));
+        kp.add_keyword("café", None);
+        let all = kp.get_all_keywords();
+        assert_eq!(all.get("naïve"), Some(&"naive".to_string()));
+        assert_eq!(all.get("café"), Some(&"café".to_string()));
+        assert_eq!(kp.get_keyword("NAÏVE"), Some("naive".to_string()));
+        assert!(kp.remove_keyword("naïve"));
+        assert!(!kp.remove_keyword("naïve"));
+        assert_eq!(kp.len(), 1);
     }
 }

@@ -3,7 +3,7 @@ use std::time::Instant;
 // use plotters::prelude::*;
 use blitztext::KeywordProcessor;
 use rand::seq::IndexedRandom;
-use rand::Rng;
+use rand::RngExt;
 // use regex::Regex;
 use regex::bytes::Regex;
 
@@ -27,7 +27,7 @@ fn benchmark_keyword_extraction() -> Vec<(usize, f64, f64)> {
 
     for keywords_length in (0..=20000).step_by(1000) {
         let all_words_chosen = all_words
-            .choose_multiple(&mut rng, 5000)
+            .sample(&mut rng, 5000)
             .collect::<Vec<_>>();
         let story = all_words_chosen
             .iter()
@@ -37,7 +37,7 @@ fn benchmark_keyword_extraction() -> Vec<(usize, f64, f64)> {
         // let story = all_words_chosen.iter().cloned().collect::<Vec<_>>().join(" ");
         // let story = all_words_chosen.join(" ");
         let unique_keywords_sublist: Vec<String> = all_words
-            .choose_multiple(&mut rng, keywords_length)
+            .sample(&mut rng, keywords_length)
             .cloned()
             .collect();
 

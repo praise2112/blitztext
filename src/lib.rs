@@ -107,6 +107,8 @@
 //!
 
 mod char_set;
+mod compiled_trie;
+mod fuzzy;
 mod keyword_processor;
 mod trie;
 mod utils;
@@ -117,7 +119,10 @@ pub use keyword_processor::KeywordProcessor;
 
 use bincode::{deserialize, serialize};
 use pyo3::prelude::*;
-use pyo3::types::PyBytes;
+use pyo3::pybacked::PyBackedStr;
+use pyo3::exceptions::PyValueError;
+use pyo3::types::{PyBytes, PyString};
+use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -125,11 +130,9 @@ use std::collections::HashMap;
 #[derive(Serialize, Deserialize)]
 struct PyKeywordProcessor(KeywordProcessor);
 
-#[pyclass(module = "blitztext", from_py_object)]
-#[derive(Serialize, Deserialize, Clone)]
+#[pyclass(module = "blitztext")]
 struct PyKeywordMatch {
-    #[pyo3(get, set)]
-    pub keyword: String,
+    keyword: Py<PyString>,
     #[pyo3(get, set)]
     pub similarity: f32,
     #[pyo3(get, set)]
@@ -138,48 +141,89 @@ struct PyKeywordMatch {
     pub end: usize,
 }
 
+/// Pickled form of a `PyKeywordMatch`.
+#[derive(Serialize, Deserialize)]
+struct KeywordMatchState {
+    keyword: String,
+    similarity: f32,
+    start: usize,
+    end: usize,
+}
+
 #[pymethods]
 impl PyKeywordMatch {
     #[new]
-    fn new(keyword: String, similarity: f32, start: usize, end: usize) -> Self {
+    fn new(py: Python<'_>, keyword: String, similarity: f32, start: usize, end: usize) -> Self {
         PyKeywordMatch {
-            keyword,
+            keyword: PyString::new(py, &keyword).unbind(),
             similarity,
             start,
             end,
         }
     }
 
-    fn __repr__(&self) -> String {
-        format!(
-            "KeywordMatch(keyword='{}', similarity={:.2}, start={}, end={})",
-            self.keyword, self.similarity, self.start, self.end
-        )
+    #[getter]
+    fn keyword(&self, py: Python<'_>) -> Py<PyString> {
+        self.keyword.clone_ref(py)
     }
 
-    pub fn __setstate__(&mut self, state: Bound<'_, PyBytes>) -> PyResult<()> {
-        *self = deserialize(state.as_bytes()).unwrap();
+    #[setter]
+    fn set_keyword(&mut self, py: Python<'_>, keyword: String) {
+        self.keyword = PyString::new(py, &keyword).unbind();
+    }
+
+    fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
+        Ok(format!(
+            "KeywordMatch(keyword='{}', similarity={:.2}, start={}, end={})",
+            self.keyword.bind(py).to_cow()?,
+            self.similarity,
+            self.start,
+            self.end
+        ))
+    }
+
+    pub fn __setstate__(&mut self, py: Python<'_>, state: Bound<'_, PyBytes>) -> PyResult<()> {
+        let state: KeywordMatchState = deserialize(state.as_bytes())
+            .map_err(|error| PyValueError::new_err(error.to_string()))?;
+        *self = PyKeywordMatch::new(py, state.keyword, state.similarity, state.start, state.end);
         Ok(())
     }
 
     pub fn __getstate__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
-        Ok(PyBytes::new(py, &serialize(&self).unwrap()))
+        let state = KeywordMatchState {
+            keyword: self.keyword.bind(py).to_cow()?.into_owned(),
+            similarity: self.similarity,
+            start: self.start,
+            end: self.end,
+        };
+        Ok(PyBytes::new(py, &serialize(&state).unwrap()))
     }
 
-    fn __getnewargs__(&self) -> PyResult<(String, f32, usize, usize)> {
-        Ok((self.keyword.clone(), self.similarity, self.start, self.end))
+    fn __getnewargs__(&self, py: Python<'_>) -> (Py<PyString>, f32, usize, usize) {
+        (self.keyword.clone_ref(py), self.similarity, self.start, self.end)
     }
 }
 
-impl From<KeywordMatch<'_>> for PyKeywordMatch {
-    fn from(km: KeywordMatch) -> Self {
-        PyKeywordMatch {
-            keyword: km.keyword.to_string(),
-            similarity: km.similarity,
-            start: km.start,
-            end: km.end,
-        }
-    }
+/// Converts matches to Python objects, sharing one string per distinct keyword.
+fn to_python_matches(
+    py: Python<'_>,
+    matches: Vec<KeywordMatch<'_>>,
+    keywords: &mut FxHashMap<(*const u8, usize), Py<PyString>>,
+) -> Vec<PyKeywordMatch> {
+    matches
+        .into_iter()
+        .map(|keyword_match| {
+            let keyword = keywords
+                .entry((keyword_match.keyword.as_ptr(), keyword_match.keyword.len()))
+                .or_insert_with(|| PyString::new(py, keyword_match.keyword).unbind());
+            PyKeywordMatch {
+                keyword: keyword.clone_ref(py),
+                similarity: keyword_match.similarity,
+                start: keyword_match.start,
+                end: keyword_match.end,
+            }
+        })
+        .collect()
 }
 
 #[pymethods]
@@ -205,40 +249,46 @@ impl PyKeywordProcessor {
     }
 
     #[pyo3(signature = (text, threshold=None))]
-    fn extract_keywords(&self, text: &str, threshold: Option<f32>) -> Vec<PyKeywordMatch> {
-        self.0
-            .extract_keywords(text, threshold)
-            .into_iter()
-            .map(PyKeywordMatch::from)
-            .collect()
+    fn extract_keywords(
+        &self,
+        py: Python<'_>,
+        text: &str,
+        threshold: Option<f32>,
+    ) -> PyResult<Vec<PyKeywordMatch>> {
+        let matches = self.0.extract_keywords(text, checked(threshold)?);
+        Ok(to_python_matches(py, matches, &mut FxHashMap::default()))
     }
 
     #[pyo3(signature = (texts, threshold=None))]
     fn parallel_extract_keywords_from_texts(
         &self,
-        texts: Vec<String>,
+        py: Python<'_>,
+        texts: Vec<PyBackedStr>,
         threshold: Option<f32>,
-    ) -> Vec<Vec<PyKeywordMatch>> {
-        self.0
-            .parallel_extract_keywords_from_texts(&texts, threshold)
+    ) -> PyResult<Vec<Vec<PyKeywordMatch>>> {
+        let threshold = checked(threshold)?;
+        let mut keywords = FxHashMap::default();
+        Ok(py
+            .detach(|| self.0.parallel_extract_keywords_from_texts(&texts, threshold))
             .into_iter()
-            .map(|matches| matches.into_iter().map(PyKeywordMatch::from).collect())
-            .collect()
+            .map(|matches| to_python_matches(py, matches, &mut keywords))
+            .collect())
     }
 
     #[pyo3(signature = (text, threshold=None))]
-    fn replace_keywords(&self, text: &str, threshold: Option<f32>) -> String {
-        self.0.replace_keywords(text, threshold)
+    fn replace_keywords(&self, text: &str, threshold: Option<f32>) -> PyResult<String> {
+        Ok(self.0.replace_keywords(text, checked(threshold)?))
     }
 
     #[pyo3(signature = (texts, threshold=None))]
     fn parallel_replace_keywords_from_texts(
         &self,
-        texts: Vec<String>,
+        py: Python<'_>,
+        texts: Vec<PyBackedStr>,
         threshold: Option<f32>,
-    ) -> Vec<String> {
-        self.0
-            .parallel_replace_keywords_from_texts(&texts, threshold)
+    ) -> PyResult<Vec<String>> {
+        let threshold = checked(threshold)?;
+        Ok(py.detach(|| self.0.parallel_replace_keywords_from_texts(&texts, threshold)))
     }
 
     fn get_all_keywords(&self) -> HashMap<String, String> {
@@ -263,11 +313,20 @@ impl PyKeywordProcessor {
 
     // https://users.rust-lang.org/t/rust-extension-module-breaks-multiprocessing-no-pickle-support/112402
     pub fn __setstate__(&mut self, state: Bound<'_, PyBytes>) -> PyResult<()> {
-        *self = deserialize(state.as_bytes()).unwrap();
+        *self = deserialize(state.as_bytes()).map_err(|error| PyValueError::new_err(error.to_string()))?;
         Ok(())
     }
     pub fn __getstate__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
         Ok(PyBytes::new(py, &serialize(&self).unwrap()))
+    }
+}
+
+fn checked(threshold: Option<f32>) -> PyResult<Option<f32>> {
+    match threshold {
+        Some(threshold) if !(0.0..=1.0).contains(&threshold) => {
+            Err(PyValueError::new_err("Threshold must be between 0 and 1"))
+        }
+        threshold => Ok(threshold),
     }
 }
 

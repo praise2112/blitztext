@@ -45,7 +45,7 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.platform.target }}
-          args: --release --out dist -i python3.9 python3.10 python3.11 python3.12 python3.13
+          args: --release --out dist -i python3.9 python3.10 python3.11 python3.12 python3.13 python3.14
           sccache: 'true'
           manylinux: auto
       - name: Upload wheels
@@ -76,7 +76,7 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.platform.target }}
-          args: --release --out dist -i python3.9 python3.10 python3.11 python3.12 python3.13
+          args: --release --out dist -i python3.9 python3.10 python3.11 python3.12 python3.13 python3.14
           sccache: 'true'
           manylinux: musllinux_1_2
       - name: Upload wheels
@@ -115,6 +115,10 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.13'
+          architecture: ${{ matrix.platform.target }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
           architecture: ${{ matrix.platform.target }}
       - name: Build wheels
         uses: PyO3/maturin-action@v1
@@ -156,6 +160,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.13'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
       - name: Build wheels
         uses: PyO3/maturin-action@v1
         env:

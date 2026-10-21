@@ -93,6 +93,8 @@ replaced = processor.replace_keywords(text)
 print(f"Replaced text: {replaced}")
 ```
 
+`start` and `end` are UTF-8 byte offsets into the text, in Rust and Python alike. For non-ASCII text in Python, slice the encoded text: `text.encode()[m.start:m.end].decode()`.
+
 ## Features
 
 ### 1. Parallel Processing
@@ -111,10 +113,12 @@ texts = ["Text 1", "Text 2", "Text 3"]
 results = processor.parallel_extract_keywords_from_texts(texts)
 ```
 
+The parallel methods release the GIL while they run, so other Python threads keep going. Changing the same processor from another thread during such a call (for example `add_keyword`) raises `RuntimeError: Already borrowed`.
+
 
 ### 2. Fuzzy Matching
 
-Both Rust and Python implementations support fuzzy matching:
+Both Rust and Python implementations support fuzzy matching. Similarity is `1 - edits / max(matched length, keyword length)`, counted in characters:
 
 ```rust
 // Rust

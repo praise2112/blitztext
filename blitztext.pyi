@@ -7,8 +7,8 @@ class KeywordMatch:
     Attributes:
         keyword (str): The matched keyword or its clean name.
         similarity (float): The similarity score of the match (1.0 for exact matches).
-        start (int): The starting index of the match in the text.
-        end (int): The ending index of the match in the text.
+        start (int): UTF-8 byte offset where the match starts in the text.
+        end (int): UTF-8 byte offset where the match ends in the text.
     """
     keyword: str
     similarity: float

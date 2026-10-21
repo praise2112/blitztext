@@ -1,4 +1,5 @@
-use serde::{Deserialize, Serialize, Serializer, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use std::collections::BTreeSet;
 
 /// The size of the bitmap used to represent the character set.
 const BITMAP_SIZE: usize = (char::MAX as usize) / 64 + 1;
@@ -142,5 +143,75 @@ impl CharSet {
     pub fn contains(&self, c: char) -> bool {
         let index = c as usize;
         (self.bitmap[index / 64] & (1 << (index % 64))) != 0
+    }
+}
+
+/// A character set that stays small when it holds mostly ASCII and Latin-1 characters.
+/// It serializes exactly like a `CharSet`.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(from = "CharSet", into = "CharSet")]
+pub(crate) struct CompactCharSet {
+    latin1: [u64; 4],
+    others: BTreeSet<char>,
+}
+
+impl CompactCharSet {
+    pub fn new() -> Self {
+        CompactCharSet {
+            latin1: [0; 4],
+            others: BTreeSet::new(),
+        }
+    }
+
+    pub fn insert(&mut self, c: char) {
+        let index = c as usize;
+        if index < 256 {
+            self.latin1[index / 64] |= 1 << (index % 64);
+        } else {
+            self.others.insert(c);
+        }
+    }
+
+    pub fn extend<I>(&mut self, iter: I)
+    where
+        I: IntoIterator<Item = char>,
+    {
+        for c in iter {
+            self.insert(c);
+        }
+    }
+
+    pub fn contains(&self, c: char) -> bool {
+        let index = c as usize;
+        if index < 256 {
+            (self.latin1[index / 64] & (1 << (index % 64))) != 0
+        } else {
+            self.others.contains(&c)
+        }
+    }
+}
+
+impl From<CharSet> for CompactCharSet {
+    fn from(set: CharSet) -> Self {
+        let mut compact = CompactCharSet::new();
+        compact.latin1.copy_from_slice(&set.bitmap[..4]);
+        for (word_index, &word) in set.bitmap.iter().enumerate().skip(4) {
+            let mut bits = word;
+            while bits != 0 {
+                let index = word_index * 64 + bits.trailing_zeros() as usize;
+                compact.others.extend(char::from_u32(index as u32));
+                bits &= bits - 1;
+            }
+        }
+        compact
+    }
+}
+
+impl From<CompactCharSet> for CharSet {
+    fn from(compact: CompactCharSet) -> Self {
+        let mut set = CharSet::new();
+        set.bitmap[..4].copy_from_slice(&compact.latin1);
+        set.extend(compact.others);
+        set
     }
 }

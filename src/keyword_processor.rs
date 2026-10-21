@@ -26,7 +26,7 @@ pub struct KeywordProcessor {
     /// Faster read-only copy of `root`, dropped when keywords change.
     #[serde(skip)]
     compiled: OnceLock<CompiledTrie>,
-    /// Number of nodes in `root`; counted on first use after deserializing.
+    /// Number of nodes in `root`, kept current by add and remove; counted once after deserializing.
     #[serde(skip)]
     node_count: OnceLock<usize>,
     /// Matching work done with `root` since keywords last changed, in text bytes.
@@ -84,7 +84,7 @@ impl KeywordProcessor {
             case_sensitive,
             allow_overlaps,
             compiled: OnceLock::new(),
-            node_count: OnceLock::new(),
+            node_count: OnceLock::from(1),
             work_since_change: AtomicUsize::new(0),
         }
     }
@@ -1592,6 +1592,17 @@ mod tests {
         let mut kp = KeywordProcessor::new();
         kp.add_keyword("istanbul", Some("IST"));
         assert_eq!(kp.replace_keywords("İstanbul istanbul", None), "İstanbul IST");
+    }
+
+    #[test]
+    fn node_count_stays_exact_through_adds_and_removes() {
+        let mut kp = KeywordProcessor::new();
+        for keyword in ["rust", "rusty", "go", "café"] {
+            kp.add_keyword(keyword, None);
+        }
+        kp.remove_keyword("rusty");
+        kp.remove_keyword("go");
+        assert_eq!(kp.node_count.get(), Some(&kp.root.count_nodes()));
     }
 
     #[test]

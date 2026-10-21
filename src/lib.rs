@@ -125,7 +125,7 @@ use std::collections::HashMap;
 #[derive(Serialize, Deserialize)]
 struct PyKeywordProcessor(KeywordProcessor);
 
-#[pyclass(module = "blitztext")]
+#[pyclass(module = "blitztext", from_py_object)]
 #[derive(Serialize, Deserialize, Clone)]
 struct PyKeywordMatch {
     #[pyo3(get, set)]
@@ -163,7 +163,7 @@ impl PyKeywordMatch {
     }
 
     pub fn __getstate__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
-        Ok(PyBytes::new_bound(py, &serialize(&self).unwrap()))
+        Ok(PyBytes::new(py, &serialize(&self).unwrap()))
     }
 
     fn __getnewargs__(&self) -> PyResult<(String, f32, usize, usize)> {
@@ -267,7 +267,7 @@ impl PyKeywordProcessor {
         Ok(())
     }
     pub fn __getstate__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
-        Ok(PyBytes::new_bound(py, &serialize(&self).unwrap()))
+        Ok(PyBytes::new(py, &serialize(&self).unwrap()))
     }
 }
 
